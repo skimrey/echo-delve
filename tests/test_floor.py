@@ -1,10 +1,11 @@
 import unittest
 
-import helpers  # noqa: F401  (headless env)
+from helpers import cached_floor
 
 from echo.bot import play_floor
-from echo.consts import BASE_SLOTS, DOORS_PER_FLOOR, ENEMIES, GRID_H, GRID_W, MAX_FLOOR
-from echo.floor import bfs_dist, generate_floor, loops_needed
+from echo.consts import BASE_SLOTS, ENEMIES, GRID_H, GRID_W, LEVER_MIN_DIST, LOCKS_PER_FLOOR, MAX_FLOOR
+from echo.floor import bfs_dist, generate_floor, loops_needed, neighbors
+from echo.score import par_plan
 from echo.sim import ANCHOR, LoopSim, Mods, move
 
 SEEDS = range(1, 13)
@@ -15,21 +16,27 @@ class Structure(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.floors = [(s, i, generate_floor(s, i, verify=False)) for s in SEEDS for i in range(1, MAX_FLOOR + 1)]
+        cls.floors = [(s, i, cached_floor(s, i, verify=False)) for s in SEEDS for i in range(1, MAX_FLOOR + 1)]
 
     def each(self):
         for s, i, f in self.floors:
             with self.subTest(seed=s, floor=i):
                 yield f
 
-    def test_door_count_matches_the_floor_number(self):
+    def locks(self, f):
+        return [f.doors[i] if kind == "door" else f.gates[i] for kind, i in f.lock_order]
+
+    def test_locks_follow_the_floor_schedule(self):
         for f in self.each():
-            self.assertEqual(len(f.doors), DOORS_PER_FLOOR[f.index - 1])
+            kinds = tuple("plate" if kind == "door" else "lever" for kind, _ in f.lock_order)
+            self.assertEqual(kinds, LOCKS_PER_FLOOR[f.index - 1])
             self.assertEqual(len(f.plates), len(f.doors))
+            self.assertEqual(len(f.levers), len(f.gates))
 
     def test_everything_is_in_bounds_on_floor_tiles(self):
         for f in self.each():
-            pts = [f.start, f.exit, *f.doors, *f.plates, *f.potions, *f.spikes, *[(x, y) for _, x, y in f.spawns]]
+            pts = [f.start, f.exit, *f.doors, *f.plates, *f.gates, *f.levers, *f.potions, *f.spikes,
+                   *[(x, y) for _, x, y in f.spawns]]
             for x, y in pts:
                 self.assertTrue(0 <= x < GRID_W and 0 <= y < GRID_H)
                 self.assertFalse(f.walls[y][x], (x, y))
@@ -45,30 +52,56 @@ class Structure(unittest.TestCase):
         for f in self.each():
             self.assertIn(f.exit, bfs_dist(f.walls, f.start))
 
-    def test_every_door_is_a_real_chokepoint(self):
+    def test_every_lock_is_a_real_chokepoint(self):
         for f in self.each():
-            for d in f.doors:
+            for d in self.locks(f):
                 self.assertNotIn(f.exit, bfs_dist(f.walls, f.start, blocked={d}))
 
-    def test_with_every_door_shut_the_exit_is_unreachable(self):
+    def test_with_every_lock_shut_the_exit_is_unreachable(self):
         for f in self.each():
-            self.assertNotIn(f.exit, bfs_dist(f.walls, f.start, blocked=set(f.doors)))
+            self.assertNotIn(f.exit, bfs_dist(f.walls, f.start, blocked=set(self.locks(f))))
 
-    def test_plate_k_is_reachable_before_door_k_so_an_echo_can_always_get_there(self):
+    def test_each_plate_or_lever_is_reachable_before_its_own_lock(self):
+        # so an echo can always get there using only the locks before it
         for f in self.each():
-            for k, plate in enumerate(f.plates):
-                region = bfs_dist(f.walls, f.start, blocked=set(f.doors[k:]))
-                self.assertIn(plate, region)
-                self.assertGreaterEqual(region[plate], 5)
+            locks = self.locks(f)
+            for k, (kind, i) in enumerate(f.lock_order):
+                region = bfs_dist(f.walls, f.start, blocked=set(locks[k:]) | set(f.levers))
+                if kind == "door":
+                    self.assertIn(f.plates[i], region)
+                    self.assertGreaterEqual(region[f.plates[i]], 5)
+                else:
+                    self.assertTrue(any(n in region for n in neighbors(*f.levers[i])))
+
+    def test_levers_are_far_from_their_gates_and_never_cut_the_map(self):
+        for f in self.each():
+            open_tiles = bfs_dist(f.walls, f.start)
+            without = bfs_dist(f.walls, f.start, blocked=set(f.levers))
+            self.assertEqual(len(without), len(open_tiles) - len(f.levers))
+            for j, lever in enumerate(f.levers):
+                walk = bfs_dist(f.walls, f.gates[j], blocked=set(f.levers) - {lever})
+                self.assertGreaterEqual(walk[lever], LEVER_MIN_DIST)
+
+    def test_a_lever_is_too_far_to_pull_and_still_reach_the_stairs_in_one_loop(self):
+        for f in self.each():
+            if not f.levers:
+                continue
+            plan = par_plan(f)
+            self.assertLessEqual(max(plan), f.limit)             # every loop of the par solution fits
+            to_exit = bfs_dist(f.walls, f.exit, blocked=set(f.levers))
+            for k, (kind, j) in enumerate(f.lock_order):
+                if kind == "gate":
+                    run_for_it = plan[k] + min(to_exit[n] for n in neighbors(*f.levers[j]) if n in to_exit)
+                    self.assertGreater(run_for_it, f.limit)
 
     def test_plates_never_sit_in_doorways_or_overlap(self):
         for f in self.each():
-            spots = [f.start, f.exit, *f.doors, *f.plates]
+            spots = [f.start, f.exit, *f.doors, *f.plates, *f.gates, *f.levers]
             self.assertEqual(len(spots), len(set(spots)))
 
     def test_nothing_spawns_on_a_special_tile_or_near_the_start(self):
         for f in self.each():
-            special = {f.start, f.exit, *f.doors, *f.plates, *f.potions, *f.spikes}
+            special = {f.start, f.exit, *f.doors, *f.plates, *f.gates, *f.levers, *f.potions, *f.spikes}
             dist = bfs_dist(f.walls, f.start)
             seen = set()
             for kind, x, y in f.spawns:
@@ -83,14 +116,14 @@ class Structure(unittest.TestCase):
             kinds = {k for k, _, _ in f.spawns}
             if f.index < 2:
                 self.assertEqual(kinds - {"crawler"}, set())
-            if f.index < 3:
+            if f.index < 4:
                 self.assertNotIn("brute", kinds)
             if f.index < MAX_FLOOR:
                 self.assertNotIn("warden", kinds)
 
     def test_the_last_floor_has_a_warden_near_the_stairs(self):
         for s in SEEDS:
-            f = generate_floor(s, MAX_FLOOR, verify=False)
+            f = cached_floor(s, MAX_FLOOR, verify=False)
             wardens = [(x, y) for k, x, y in f.spawns if k == "warden"]
             self.assertTrue(wardens, s)
             x, y = wardens[0]
@@ -105,6 +138,8 @@ class Structure(unittest.TestCase):
 
     def test_limit_leaves_time_for_the_longest_walk(self):
         for f in self.each():
+            if f.levers:
+                continue                          # lever floors are tuned tighter (see the test above)
             far = max(bfs_dist(f.walls, f.start, blocked=set(f.doors[k:]))[p] for k, p in enumerate(f.plates))
             far = max(far, bfs_dist(f.walls, f.start)[f.exit])
             self.assertGreater(f.limit, far * 1.5)
@@ -126,7 +161,7 @@ class NoShortcut(unittest.TestCase):
     def test_walking_straight_to_the_exit_without_echoes_never_works(self):
         for s in range(1, 9):
             for i in range(1, MAX_FLOOR + 1):
-                f = generate_floor(s, i, verify=False)
+                f = cached_floor(s, i, verify=False)
                 sim = LoopSim(f, [], Mods())
                 from echo.floor import bfs_path
                 path = bfs_path(f.walls, f.start, f.exit)
@@ -141,20 +176,20 @@ class Verified(unittest.TestCase):
     def test_every_verified_floor_is_cleared_by_the_bot_with_the_baseline_kit(self):
         for s in range(1, 9):
             for i in range(1, MAX_FLOOR + 1):
-                f = generate_floor(s, i)
+                f = cached_floor(s, i)
                 with self.subTest(seed=s, floor=i):
                     self.assertTrue(f.verified)
                     fp = play_floor(f)
                     self.assertEqual(fp.status, "cleared")
                     self.assertLessEqual(fp.loop_no, BASE_SLOTS + 1)
 
-    def test_the_bot_needs_exactly_one_echo_per_door(self):
-        # the loop that clears a floor is at least len(doors)+1: echoes really are required
+    def test_the_bot_needs_an_echo_per_lock(self):
+        # the loop that clears a floor is at least len(locks)+1: echoes really are required
         for s in range(1, 6):
             for i in range(1, MAX_FLOOR + 1):
-                f = generate_floor(s, i)
+                f = cached_floor(s, i)
                 fp = play_floor(f)
-                self.assertGreaterEqual(fp.loop_no, len(f.doors) + 1, (s, i))
+                self.assertGreaterEqual(fp.loop_no, len(f.lock_order) + 1, (s, i))
 
     def test_verification_matches_replaying_the_stored_scripts(self):
         # replay the winning run's echoes and the final actions by hand to be sure the sim is deterministic
@@ -166,10 +201,12 @@ class Verified(unittest.TestCase):
     def test_anchoring_everything_never_wins(self):
         f = generate_floor(2, 3)
         from echo.run import FloorPlay
-        fp = FloorPlay(f, Mods(), BASE_SLOTS + 1)
+        fp = FloorPlay(f, Mods(), BASE_SLOTS)
         while fp.status == "playing":
             fp.act(ANCHOR)
-        self.assertEqual(fp.status, "failed")
+        self.assertEqual(fp.status, "full")
+        self.assertEqual(fp.loop_no, BASE_SLOTS + 1)
+        self.assertEqual(len(fp.scripts), BASE_SLOTS + 1)
 
 
 if __name__ == "__main__":

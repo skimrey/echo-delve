@@ -18,6 +18,8 @@ from echo.consts import BASE_SLOTS, MAX_FLOOR, PERKS, UPGRADES
 from echo.game_screen import OY, GameScreen
 from echo.menus import (EndScreen, ForgeScreen, HelpScreen, PauseScreen, TitleScreen,
                         UpgradeScreen)
+from echo.unravel_screen import UnravelScreen
+from echo.cinematics import IntroScreen, VictoryScreen
 from echo.run import FloorPlay
 from echo.sim import GhostScript
 
@@ -29,6 +31,7 @@ class UITestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.app = App(meta_path=os.path.join(self.tmp.name, "meta.json"), seed=11)
+        self.app.meta.data["seen_intro"] = True        # the intro has its own tests
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -79,7 +82,7 @@ class UITestCase(unittest.TestCase):
         f = make_floor(rows, **kw)
         run = self.app.run
         run.floor = f
-        run.play = FloorPlay(f, run.mods(), run.slots + 1)
+        run.play = FloorPlay(f, run.mods(), run.slots)
         run.seen = set()
         if hp is not None:
             run.sim.player.hp = hp
@@ -93,7 +96,7 @@ class UITestCase(unittest.TestCase):
 class TitleTests(UITestCase):
     def test_buttons_present_and_screen_draws(self):
         self.assertIsInstance(self.app.screen, TitleScreen)
-        self.assertEqual([b.tag for b in self.app.screen.buttons], ["new", "forge", "help", "quit"])
+        self.assertEqual([b.tag for b in self.app.screen.buttons], ["new", "story", "forge", "help", "quit"])
         self.draw_ok()
 
     def test_new_run_by_button_and_by_n_and_enter(self):
@@ -319,9 +322,16 @@ class AnchorInput(UITestCase):
         self.assertEqual(self.rn.play.loop_no, 1)
 
     def test_last_loop_warns(self):
-        self.rn.play.loop_no = self.rn.play.loops_max
+        for _ in range(BASE_SLOTS):
+            self.keys(pygame.K_e, pygame.K_e)
+        self.assertIn("last loop", self.say_of())
         self.key(pygame.K_e)
         self.assertIn("LAST LOOP", self.say_of())
+        self.assertIn("unravel", self.say_of())
+        self.key(pygame.K_ESCAPE)
+        self.rn.threads = 0
+        self.key(pygame.K_e)
+        self.assertIn("ends the run", self.say_of())
         self.key(pygame.K_ESCAPE)
 
 
@@ -332,12 +342,15 @@ class LoopFlow(UITestCase):
         self.assertTrue(self.rn.sim.plate_held(0))
         self.keys(pygame.K_e, pygame.K_e)
         self.assertEqual(self.rn.play.loop_no, 2)
-        self.assertIn("Loop 2/%d begins" % (BASE_SLOTS + 1), self.say_of())
+        self.assertIn("Loop 2 begins", self.say_of())
         self.draw_ok()
         self.keys(*[pygame.K_RIGHT] * 6)                 # walk in step with the echo
         self.assertTrue(self.rn.sim.door_open(0))
         self.keys(pygame.K_DOWN, pygame.K_DOWN, pygame.K_DOWN)
         self.assertEqual(self.rn.state, "upgrade")
+        self.assertIsInstance(self.app.screen, VictoryScreen)
+        self.draw_ok()
+        self.keys(pygame.K_RETURN, pygame.K_RETURN)      # finish the tally, then continue
         self.assertIsInstance(self.app.screen, UpgradeScreen)
         self.draw_ok()
         self.key(pygame.K_1)
@@ -369,8 +382,9 @@ class LoopFlow(UITestCase):
         self.assertEqual(self.rn.play.loop_no, 2)
         self.assertIsInstance(self.app.screen, GameScreen)
 
-    def test_running_out_of_loops_shows_the_end_screen_once(self):
+    def test_running_out_of_loops_and_threads_shows_the_end_screen_once(self):
         self.game(PLATE_ROWS)
+        self.rn.threads = 0
         for _ in range(BASE_SLOTS + 1):
             self.assertIsInstance(self.app.screen, GameScreen)
             self.keys(pygame.K_e, pygame.K_e)
@@ -386,12 +400,17 @@ class LoopFlow(UITestCase):
         self.rn.cleared = MAX_FLOOR - 1
         f = make_floor(["SE"])
         self.rn.floor = f
-        self.rn.play = FloorPlay(f, self.rn.mods(), self.rn.slots + 1)
+        self.rn.play = FloorPlay(f, self.rn.mods(), self.rn.slots)
         self.app.replace(GameScreen(self.app))
         self.key(pygame.K_RIGHT)
+        self.assertIsInstance(self.app.screen, VictoryScreen)
+        self.assertTrue(self.app.screen.final)
+        self.assertEqual(self.app.meta.data["runs"], 0)  # recorded once the ending is shown
+        self.keys(pygame.K_RETURN, pygame.K_RETURN)
         self.assertIsInstance(self.app.screen, EndScreen)
         self.assertEqual(self.rn.state, "won")
-        self.assertEqual((self.app.meta.data["wins"], self.app.meta.data["shards"]), (1, MAX_FLOOR + 3))
+        self.assertEqual((self.app.meta.data["wins"], self.app.meta.data["shards"]), (1, MAX_FLOOR + 3 + 2))
+        self.assertEqual(self.app.meta.data["best_score"], 1000)
         self.draw_ok()
 
 
@@ -399,6 +418,8 @@ class UpgradeAndEnd(UITestCase):
     def to_upgrade(self):
         self.game(["SE"])
         self.key(pygame.K_RIGHT)
+        self.assertIsInstance(self.app.screen, VictoryScreen)
+        self.keys(pygame.K_RETURN, pygame.K_RETURN)
         self.assertIsInstance(self.app.screen, UpgradeScreen)
 
     def test_each_card_by_key_and_by_click(self):
@@ -444,6 +465,317 @@ class UpgradeAndEnd(UITestCase):
                 else:
                     self.key(key)
                 self.assertIsInstance(self.app.screen, cls, (tag, how))
+
+
+class UnravelInput(UITestCase):
+    def setUp(self):
+        super().setUp()
+        self.game(PLATE_ROWS, limit=50)
+
+    def fill_well(self):
+        for _ in range(BASE_SLOTS + 1):
+            self.keys(pygame.K_RIGHT, pygame.K_e, pygame.K_e)
+
+    @property
+    def us(self):
+        self.assertIsInstance(self.app.screen, UnravelScreen)
+        return self.app.screen
+
+    def test_a_full_well_opens_the_picker_instead_of_ending_the_run(self):
+        self.fill_well()
+        self.assertTrue(self.us.forced)
+        self.assertEqual(self.rn.state, "unravel")
+        self.assertEqual(self.app.meta.data["runs"], 0)
+        self.assertEqual([b.tag for b in self.us.buttons if b.tag.startswith("echo:")],
+                         ["echo:%d" % n for n in range(1, BASE_SLOTS + 2)])
+        self.draw_ok()
+
+    def test_enter_needs_a_selection_then_unravels_by_key(self):
+        self.fill_well()
+        self.key(pygame.K_RETURN)
+        self.assertIn("Pick an echo first", self.say_of())
+        self.assertEqual(self.rn.threads, 2)
+        self.key(pygame.K_9)
+        self.assertIn("no echo 9", self.say_of())
+        self.key(pygame.K_2)
+        self.assertEqual(self.us.selected, 2)
+        self.assertIn("echo 2", self.btn("confirm").label)
+        self.draw_ok()
+        self.key(pygame.K_RETURN)
+        self.assertEqual(self.rn.state, "playing")
+        self.assertEqual(self.rn.threads, 1)
+        self.assertNotIn(2, [s.label for s in self.rn.play.scripts])
+        self.assertIn("Echo 2 unravelled", self.say_of())
+        self.assertIn("last loop", self.say_of())
+        self.assertEqual(self.rn.sim.turn, 0)
+        self.draw_ok()
+
+    def test_unravel_by_clicking_a_card_then_the_button(self):
+        self.fill_well()
+        new = self.rn.play.last_label
+        self.click_btn("echo:%d" % new)
+        self.assertIn("just played", self.say_of())
+        self.click_btn("confirm")
+        self.assertIsInstance(self.app.screen, GameScreen)
+        self.assertEqual(len(self.rn.play.scripts), BASE_SLOTS)
+
+    def test_arrows_cycle_the_selection(self):
+        self.fill_well()
+        self.key(pygame.K_RIGHT)
+        self.assertEqual(self.us.selected, 1)
+        self.key(pygame.K_LEFT)
+        self.assertEqual(self.us.selected, BASE_SLOTS + 1)
+        self.key(pygame.K_RIGHT)
+        self.assertEqual(self.us.selected, 1)
+
+    def test_escape_cannot_dodge_a_forced_choice_and_end_run_needs_two_clicks(self):
+        self.fill_well()
+        self.key(pygame.K_ESCAPE)
+        self.assertIsInstance(self.app.screen, UnravelScreen)
+        self.assertIn("end the run", self.say_of())
+        self.key(pygame.K_SPACE)                     # game keys do nothing here
+        self.assertEqual(self.rn.state, "unravel")
+        self.click_btn("end")
+        self.assertIsInstance(self.app.screen, UnravelScreen)
+        self.key(pygame.K_ESCAPE)                    # cancels the end confirmation only
+        self.assertEqual(self.btn("end").label, "End Run")
+        self.click_btn("end")
+        self.click_btn("echo:1")                     # any other choice disarms it too
+        self.assertEqual(self.btn("end").label, "End Run")
+        self.click_btn("end")
+        self.click_btn("end")
+        self.assertIsInstance(self.app.screen, EndScreen)
+        self.assertEqual(self.rn.state, "dead")
+        self.assertEqual(self.app.meta.data["runs"], 1)
+
+    def test_help_from_the_picker_returns_to_it(self):
+        self.fill_well()
+        self.key(pygame.K_h)
+        self.assertIsInstance(self.app.screen, HelpScreen)
+        self.key(pygame.K_ESCAPE)
+        self.assertIsInstance(self.app.screen, UnravelScreen)
+
+    def test_voluntary_unravel_by_key_and_button_and_escape_cancels(self):
+        self.keys(pygame.K_RIGHT, pygame.K_e, pygame.K_e)
+        for opener in ("key", "button"):
+            if opener == "key":
+                self.key(pygame.K_u)
+            else:
+                self.click_btn("unravel")
+            self.assertFalse(self.us.forced)
+            self.draw_ok()
+            self.key(pygame.K_ESCAPE)
+            self.assertIsInstance(self.app.screen, GameScreen)
+            self.assertIn("cancelled", self.say_of())
+        self.assertEqual((self.rn.threads, len(self.rn.play.scripts)), (2, 1))
+
+    def test_voluntary_unravel_restarts_the_loop_in_progress(self):
+        self.keys(pygame.K_RIGHT, pygame.K_RIGHT, pygame.K_e, pygame.K_e)
+        self.keys(pygame.K_RIGHT, pygame.K_RIGHT, pygame.K_RIGHT)
+        self.assertEqual(self.rn.sim.turn, 3)
+        self.keys(pygame.K_u, pygame.K_1, pygame.K_RETURN)
+        self.assertIsInstance(self.app.screen, GameScreen)
+        self.assertEqual((self.rn.sim.turn, self.rn.sim.player.pos), (0, (0, 0)))
+        self.assertEqual((self.rn.play.scripts, self.rn.threads), ([], 1))
+        self.assertIn("next echo: 1", self.say_of())
+
+    def test_unravel_refused_with_a_reason(self):
+        self.key(pygame.K_u)
+        self.assertIsInstance(self.app.screen, GameScreen)
+        self.assertIn("No echoes", self.say_of())
+        self.keys(pygame.K_e, pygame.K_e)
+        self.rn.threads = 0
+        self.click_btn("unravel")
+        self.assertIsInstance(self.app.screen, GameScreen)
+        self.assertIn("No threads", self.say_of())
+
+    def test_unravel_cancels_a_pending_anchor(self):
+        self.keys(pygame.K_e, pygame.K_e, pygame.K_e)
+        self.assertTrue(self.gs.confirm)
+        self.key(pygame.K_u)
+        self.key(pygame.K_ESCAPE)
+        self.assertFalse(self.gs.confirm)
+        self.assertEqual(self.rn.play.loop_no, 2)
+
+    def test_panel_moves_out_of_the_way_of_a_route_along_the_bottom(self):
+        rows = ["#" * 12] * 20 + ["S.........a#", "#########.##", "#########1##", "#########E##"]
+        self.game(rows, limit=50)
+        self.keys(*[pygame.K_RIGHT] * 10, pygame.K_e, pygame.K_e)
+        self.keys(pygame.K_RIGHT, pygame.K_e, pygame.K_e)
+        self.key(pygame.K_u)
+        self.assertGreater(self.us.panel_y, 0)
+        self.key(pygame.K_1)
+        self.assertEqual(self.us.panel_y, 0)
+        self.assertEqual(self.btn("confirm").rect.y, 136)
+        self.draw_ok()
+        self.key(pygame.K_RETURN)
+        self.assertEqual([s.label for s in self.rn.play.scripts], [2])
+
+    def test_effects_under_the_picker_keep_fading(self):
+        self.keys(pygame.K_RIGHT, pygame.K_e, pygame.K_e)
+        self.gs.effects.append(["flash", (0, 0), (255, 255, 255), 0.3])
+        gs = self.gs
+        self.key(pygame.K_u)
+        self.app.tick(1.0)
+        self.assertEqual(gs.effects, [])
+
+    def test_hud_draws_every_slot_state(self):
+        self.keys(pygame.K_RIGHT, pygame.K_e, pygame.K_e)
+        self.keys(pygame.K_e, pygame.K_e)
+        self.keys(pygame.K_u, pygame.K_1, pygame.K_RETURN)
+        self.assertEqual(self.rn.play.free_label(), 1)
+        self.draw_ok()
+        self.fill_well()
+        self.draw_ok()
+
+
+class StoryScenes(UITestCase):
+    def test_the_intro_plays_before_the_first_run_only(self):
+        self.app.meta.data["seen_intro"] = False
+        self.click_btn("new")
+        self.assertIsInstance(self.app.screen, IntroScreen)
+        for i in range(3):
+            self.app.tick(0.4)
+            self.draw_ok()
+            self.key(pygame.K_RETURN)            # first press finishes the line...
+            self.assertEqual(self.app.screen.i, i)
+            self.key(pygame.K_RETURN)            # ...the second turns the page
+            self.assertEqual(self.app.screen.i, i + 1)
+        self.key(pygame.K_LEFT)
+        self.assertEqual(self.app.screen.i, 2)
+        self.key(pygame.K_ESCAPE)
+        self.assertIsInstance(self.app.screen, GameScreen)
+        self.assertTrue(type(self.app.meta)(self.app.meta.path).data["seen_intro"])
+        self.app.to_title()
+        self.key(pygame.K_n)
+        self.assertIsInstance(self.app.screen, GameScreen)
+
+    def test_reading_the_whole_intro_by_clicks_starts_the_run(self):
+        self.app.meta.data["seen_intro"] = False
+        self.key(pygame.K_n)
+        from echo import story
+        for _ in range(len(story.INTRO) * 2):
+            self.assertIsInstance(self.app.screen, IntroScreen)
+            self.click((480, 200))
+        self.assertIsInstance(self.app.screen, GameScreen)
+
+    def test_every_intro_panel_draws(self):
+        self.key(pygame.K_s)
+        self.assertIsInstance(self.app.screen, IntroScreen)
+        from echo import story
+        for i in range(len(story.INTRO)):
+            self.app.screen.i = i
+            for t in (0.1, 1.0, 3.0):
+                self.app.screen.t = t
+                self.draw_ok()
+        self.click_btn("skip")
+        self.assertIsInstance(self.app.screen, TitleScreen)
+
+    def test_victory_scene_skips_then_continues_by_click(self):
+        self.game(["S..E"])
+        self.keys(pygame.K_RIGHT, pygame.K_RIGHT, pygame.K_RIGHT)
+        v = self.app.screen
+        self.assertIsInstance(v, VictoryScreen)
+        for _ in range(16):
+            self.app.tick(0.3)
+            if _ % 3 == 0:
+                self.draw_ok()
+        self.assertTrue(v.finished)
+        self.assertLess(v.parent.ghost_fade, 0.05)
+        self.click((5, 5))
+        self.assertIsInstance(self.app.screen, UpgradeScreen)
+        self.draw_ok()
+
+    def test_victory_tally_matches_the_result(self):
+        self.game(["S..E"])
+        self.keys(pygame.K_SPACE, pygame.K_RIGHT, pygame.K_RIGHT, pygame.K_RIGHT)
+        v = self.app.screen
+        self.assertFalse(v.finished)
+        self.key(pygame.K_SPACE)                 # any key skips to the end of the tally
+        self.assertTrue(v.finished)
+        rows = dict((label, value) for label, value, _ in v.rows)
+        self.assertEqual((rows["Turns taken"], rows["Par"], rows["Efficiency"]), (4, 3, 75))
+        self.assertEqual(rows["Score"], self.rn.last_result.score)
+        self.draw_ok()
+
+
+class Animations(UITestCase):
+    def test_moves_slide_and_strikes_lunge(self):
+        self.game(["SC...", "....."])
+        self.key(pygame.K_DOWN)
+        self.assertIn("P", self.gs.tweens)
+        self.draw_ok()
+        self.app.tick(0.3)
+        self.assertNotIn("P", self.gs.tweens)
+        self.game(["SC...", "....."])
+        self.key(pygame.K_RIGHT)
+        self.assertIn("P", self.gs.lunges)
+        self.draw_ok()
+
+    def test_ending_a_loop_plays_the_rewind_and_unravelling_burns_the_echo(self):
+        self.game(PLATE_ROWS)
+        self.keys(pygame.K_RIGHT, pygame.K_RIGHT, pygame.K_e, pygame.K_e)
+        fx = self.gs.story_fx
+        self.assertEqual((fx["kind"], fx["label"], fx["loop"]), ("rewind", 1, 2))
+        for _ in range(6):
+            self.app.tick(0.15)
+            self.draw_ok()
+        self.app.tick(1.0)
+        self.assertIsNone(self.gs.story_fx)
+        self.keys(pygame.K_u, pygame.K_1, pygame.K_RETURN)
+        self.assertEqual(self.gs.story_fx["kind"], "unravel")
+        self.app.tick(0.5)
+        self.draw_ok()
+
+    def test_sconces_light_when_aurel_comes_near(self):
+        self.app.new_run()
+        gs, run = self.gs, self.rn
+        from echo.run import LAMP_REACH
+        import math
+        for tp in run.lit:
+            p = run.sim.player.pos
+            self.assertLessEqual(math.hypot(tp[0] - p[0], tp[1] - p[1]), LAMP_REACH)
+        cold = [tp for tp in gs.torches if tp not in run.lit]
+        self.assertTrue(cold)
+        target = cold[0]
+        self.assertIn("Walk within two steps", gs.describe_tile(target) if target in run.seen else
+                      "Walk within two steps")
+        run.sim.player.x, run.sim.player.y = target[0], target[1] + 1
+        self.assertEqual(run.light_lamps(), [target])
+        gs.reveal()
+        self.assertIn(target, gs.ignite)                       # it flares as it catches
+        self.assertIn("lit by your hand", gs.describe_tile(target))
+        self.assertTrue({(target[0], target[1] + 2)} <= run.lamp_glow() <= gs.visible | run.lamp_glow())
+        self.draw_ok()
+
+
+class LeverScreens(UITestCase):
+    ROWS = ["S..g.E", "...L..", "......"]
+
+    def test_levers_and_gates_draw_explain_themselves_and_report_pulls(self):
+        self.game(self.ROWS)
+        self.rn.seen |= {(x, y) for x in range(6) for y in range(3)}
+        self.gs.visible = set(self.rn.seen)
+        self.assertIn("Gate A: shut", self.gs.describe_tile((3, 0)))
+        self.assertIn("Lever A: walk into it", self.gs.describe_tile((3, 1)))
+        self.draw_ok()
+        self.keys(pygame.K_DOWN, pygame.K_RIGHT, pygame.K_RIGHT, pygame.K_RIGHT)
+        self.assertIn("You pull lever A: gate A opens.", self.say_of())
+        for _ in range(4):
+            self.app.tick(0.1)
+            self.draw_ok()
+        self.keys(pygame.K_e, pygame.K_e)
+        self.assertIn("Echo 1 pulls it on turn 3.", self.gs.describe_tile((3, 0)))
+        self.keys(pygame.K_u)
+        self.assertIsInstance(self.app.screen, UnravelScreen)
+        self.key(pygame.K_1)
+        self.draw_ok()
+
+    def test_a_shut_gate_says_which_lever(self):
+        self.game(self.ROWS)
+        self.keys(pygame.K_RIGHT, pygame.K_RIGHT, pygame.K_RIGHT)
+        self.assertIn("Gate A is shut. Pulling lever A", self.say_of())
+        self.assertEqual(self.rn.sim.turn, 2)
 
 
 class PauseAndHelp(UITestCase):
@@ -574,7 +906,7 @@ class PathsHoverEffects(UITestCase):
         self.assertTrue(self.app.screen.update(0.2))
         self.assertTrue(self.app.screen.update(2.0))
         self.assertFalse(self.gs.effects)
-        self.assertFalse(self.app.screen.update(0.1))
+        self.assertFalse(self.gs.tweens or self.gs.lunges)
 
     def test_draw_with_many_echoes_and_enemies_and_every_feature(self):
         self.game(["S..p.^..vC.A.B.W", "....1....a......", "..E............."])
@@ -595,7 +927,7 @@ class Storm(UITestCase):
     KEYS = [pygame.K_RETURN, pygame.K_ESCAPE, pygame.K_SPACE, pygame.K_e, pygame.K_TAB, pygame.K_h,
             pygame.K_n, pygame.K_f, pygame.K_a, pygame.K_w, pygame.K_s, pygame.K_d, pygame.K_UP,
             pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
-            pygame.K_PERIOD, pygame.K_F1]
+            pygame.K_PERIOD, pygame.K_F1, pygame.K_u, pygame.K_u, pygame.K_5, pygame.K_TAB]
 
     def test_random_input_never_raises_and_keeps_invariants(self):
         screens_seen = set()
@@ -625,12 +957,35 @@ class Storm(UITestCase):
                 if run and run.state == "playing":
                     p = run.sim.player
                     self.assertTrue(0 <= p.x < 40 and 0 <= p.y < 24)
-                    self.assertLessEqual(run.play.loop_no, run.play.loops_max)
+                    self.assertLessEqual(len(run.play.scripts), run.play.slots)
                     self.assertLessEqual(run.sim.turn, run.sim.limit)
+                if run and run.state == "unravel":
+                    self.assertIsInstance(self.app.screen, (UnravelScreen, HelpScreen))
+                if run:
+                    self.assertGreaterEqual(run.threads, 0)
             self.app.draw()
-        for needed in ("GameScreen", "PauseScreen", "HelpScreen", "EndScreen"):
+        for needed in ("GameScreen", "PauseScreen", "HelpScreen", "EndScreen", "UnravelScreen"):
             self.assertIn(needed, screens_seen)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AurelsChapters(UITestCase):
+    def test_an_interlude_before_floor_five_the_first_time_only(self):
+        from echo import story
+        from echo.cinematics import IntroScreen
+        for first in (True, False):
+            self.app.new_run()
+            run = self.app.run
+            run.floor_no, run.state = 4, "upgrade"
+            run.options = ["hp", "atk", "sight"]
+            self.app.choose_upgrade("hp")
+            if first:
+                self.assertIsInstance(self.app.screen, IntroScreen)
+                self.assertEqual((self.app.screen.title, self.app.screen.panels), ("Aurel", story.INTERLUDES[5]))
+                self.app.draw()
+                self.key(pygame.K_ESCAPE)
+            self.assertIsInstance(self.app.screen, GameScreen)
+            self.assertEqual(self.app.run.floor_no, 5)

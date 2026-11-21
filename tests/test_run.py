@@ -5,8 +5,9 @@ import unittest
 
 from helpers import D, L, R, make_floor
 
-from echo.bot import bot_action
-from echo.consts import BASE_ATK, BASE_HP, BASE_SLOTS, MAX_FLOOR, PERKS, SLOT_CAP, UPGRADES
+from echo.bot import bot_action, lock_goal
+from echo.consts import (BASE_ATK, BASE_HP, BASE_SLOTS, BASE_THREADS, MAX_FLOOR, PERKS, SLOT_CAP,
+                         THREADS_PER_FLOOR, UPGRADES)
 from echo.run import FloorPlay, Meta, Run
 from echo.sim import ANCHOR, WAIT, move
 
@@ -15,7 +16,7 @@ def rig(run, rows, **kw):
     """Swap the run's current floor for a hand-drawn one."""
     f = make_floor(rows, **kw)
     run.floor = f
-    run.play = FloorPlay(f, run.mods(), run.slots + 1)
+    run.play = FloorPlay(f, run.mods(), run.slots)
     run.seen = set()
     return f
 
@@ -28,17 +29,18 @@ def bot_run(run, pick="hp", max_steps=9000):
             done = set()
             continue
         f = run.floor
-        remaining = [k for k in range(len(f.plates)) if k not in done]
-        target = remaining[0] if remaining else None
-        goal = f.plates[target] if target is not None else f.exit
+        idx = next((k for k in range(len(f.lock_order)) if k not in done), None)
+        goal, kind = lock_goal(f, done)
         lb, fl = run.play.loop_no, run.floor_no
         st = {}
         while run.state == "playing" and run.play.loop_no == lb and run.floor_no == fl and steps < max_steps:
-            run.act(bot_action(run.sim, goal, target is not None, st))
+            run.act(bot_action(run.sim, goal, kind, st))
             steps += 1
-        if (target is not None and run.floor_no == fl and run.play.last_end in ("anchor", "timeout")
-                and run.play.last_end_pos == goal):
-            done.add(target)
+        if run.floor_no == fl and kind == "plate" and run.play.last_end in ("anchor", "timeout") \
+                and run.play.last_end_pos == goal:
+            done.add(idx)
+        elif run.floor_no == fl and kind == "lever" and st.get("pulled") and run.play.last_end == "anchor":
+            done.add(idx)
     return run
 
 
@@ -47,7 +49,8 @@ class RunBasics(unittest.TestCase):
         r = Run(seed=1)
         self.assertEqual((r.state, r.floor_no, r.cleared), ("playing", 1, 0))
         self.assertEqual((r.max_hp, r.atk, r.slots), (BASE_HP, BASE_ATK, BASE_SLOTS))
-        self.assertEqual(r.play.loops_max, BASE_SLOTS + 1)
+        self.assertEqual(r.play.slots, BASE_SLOTS)
+        self.assertEqual(r.threads, BASE_THREADS)
         self.assertTrue(r.floor.verified)
 
     def test_same_seed_same_dungeon(self):
@@ -117,19 +120,34 @@ class Loops(unittest.TestCase):
         self.assertEqual(r.state, "playing")
         self.assertEqual(r.play.loop_no, 2)
 
-    def test_running_out_of_loops_ends_the_run(self):
+    def test_a_full_well_asks_for_an_unravel_instead_of_ending_the_run(self):
         r = self.r
         for i in range(BASE_SLOTS + 1):
             self.assertEqual(r.state, "playing")
             r.act(ANCHOR)
+        self.assertEqual(r.state, "unravel")
+        self.assertEqual(r.play.status, "full")
+        self.assertEqual(len(r.play.scripts), BASE_SLOTS + 1)
+        self.assertEqual(r.play.last_label, BASE_SLOTS + 1)
+        self.assertIn("unravel", r.act(WAIT).message.lower())
+
+    def test_running_out_of_loops_with_no_threads_ends_the_run(self):
+        r = self.r
+        r.threads = 0
+        for i in range(BASE_SLOTS + 1):
+            self.assertEqual(r.state, "playing")
+            r.act(ANCHOR)
         self.assertEqual(r.state, "dead")
-        self.assertIn("no echoes left", r.reason)
-        self.assertEqual(r.play.status, "failed")
+        self.assertIn("no threads left", r.reason)
+        self.assertEqual(r.play.status, "full")
 
     def test_dying_on_the_last_loop_has_its_own_reason(self):
         r = Run(seed=1)
         rig(r, ["SC..", "...."])
-        r.play.loop_no = r.play.loops_max
+        r.threads = 0
+        for _ in range(BASE_SLOTS):
+            r.act(ANCHOR)
+        self.assertTrue(r.play.last_loop)
         r.sim.player.hp = 1
         r.sim.enemies[0].awake = True
         r.act(WAIT)
@@ -188,7 +206,7 @@ class Upgrades(unittest.TestCase):
             self.assertEqual((r.floor_no, r.state), (2, "playing"))
             self.assertEqual(r.floor.index, 2)
             self.assertEqual(r.sim.player.max_hp, r.max_hp)
-            self.assertEqual(r.play.loops_max, r.slots + 1)
+            self.assertEqual(r.play.slots, r.slots)
 
     def test_specific_effects(self):
         for key, field, delta in (("hp", "max_hp", 2), ("atk", "atk", 1), ("slot", "slots", 1),
@@ -223,7 +241,131 @@ class Upgrades(unittest.TestCase):
         r.act(R)
         self.assertEqual(r.state, "won")
         self.assertEqual(r.cleared, MAX_FLOOR)
-        self.assertEqual(r.shards_earned(), MAX_FLOOR + 3)
+        self.assertEqual(r.last_result.grade, "S+")          # a par clear also earns bonus shards
+        self.assertEqual(r.shards_earned(), MAX_FLOOR + 3 + 2)
+
+
+class Unravel(unittest.TestCase):
+    ROWS = Loops.ROWS
+
+    def setUp(self):
+        self.r = Run(seed=1)
+        rig(self.r, self.ROWS, limit=50)
+
+    def fill(self, plans):
+        for plan in plans:
+            for a in plan + [ANCHOR]:
+                self.r.act(a)
+
+    def test_recorded_echoes_remember_their_loop_and_end(self):
+        self.fill([[R, R], [R]])
+        a, b = self.r.play.scripts
+        self.assertEqual((a.label, a.loop, a.end_pos), (1, 1, (2, 0)))
+        self.assertEqual((b.label, b.loop, b.end_pos), (2, 2, (1, 0)))
+
+    def test_unravel_frees_the_slot_and_the_next_loop_rewrites_it(self):
+        r = self.r
+        self.fill([[R], [R, R], [R, R, R]])
+        r.act(R)
+        r.unravel(2)
+        self.assertEqual(r.threads, BASE_THREADS - 1)
+        self.assertEqual([s.label for s in r.play.scripts], [1, 3])
+        self.assertEqual((r.sim.turn, r.sim.record, r.sim.player.pos), (0, [], r.floor.start))
+        self.assertEqual(sorted(g.key for g in r.sim.ghosts), ["G1", "G3"])
+        self.assertEqual(r.play.loop_no, 5)                  # the interrupted loop still counts
+        self.assertEqual(r.play.free_label(), 2)
+        r.act(R)
+        r.act(ANCHOR)
+        self.assertEqual([s.label for s in r.play.scripts], [1, 2, 3])
+        self.assertEqual(r.play.script(2).actions, [R])
+        self.assertEqual(r.play.script(2).loop, 5)
+        self.assertEqual([g.key for g in r.sim.ghosts], ["G1", "G2", "G3"])
+
+    def test_a_full_well_can_discard_the_loop_just_played(self):
+        r = self.r
+        self.fill([[R]] * BASE_SLOTS + [[R, R]])
+        self.assertEqual(r.state, "unravel")
+        kept = [list(s.actions) for s in r.play.scripts[:-1]]
+        r.unravel(r.play.last_label)
+        self.assertEqual(r.state, "playing")
+        self.assertEqual(r.play.status, "playing")
+        self.assertEqual([s.actions for s in r.play.scripts], kept)
+        self.assertTrue(r.play.last_loop)
+
+    def test_a_ruined_floor_is_recoverable(self):
+        # every slot holds a useless echo; unravel one and record the plate-holder in its place
+        r = self.r
+        self.fill([[R, R]] * (BASE_SLOTS + 1))
+        self.assertEqual(r.state, "unravel")
+        r.unravel(3)
+        for a in [R] * 6 + [ANCHOR]:
+            r.act(a)
+        self.assertEqual(r.state, "unravel")                # that loop ended short of the stairs too
+        r.unravel(1)
+        for a in [R] * 6 + [D, D, D]:
+            res = r.act(a)
+            self.assertEqual(res.message, "")
+        self.assertEqual(r.state, "upgrade")
+        self.assertEqual(r.threads, BASE_THREADS - 2 + THREADS_PER_FLOOR)
+
+    def test_running_out_of_threads_after_unravelling_ends_the_run(self):
+        r = self.r
+        r.threads = 1
+        self.fill([[R]] * (BASE_SLOTS + 1))
+        r.unravel(1)
+        r.act(ANCHOR)
+        self.assertEqual((r.state, r.threads), ("dead", 0))
+        self.assertIn("no threads left", r.reason)
+
+    def test_what_cannot_be_unravelled(self):
+        r = self.r
+        self.assertIn("No echoes", r.unravel_problem())
+        with self.assertRaises(ValueError):
+            r.unravel(1)
+        self.fill([[R]])
+        with self.assertRaises(ValueError):
+            r.unravel(7)                                    # no such echo: nothing is spent
+        self.assertEqual((r.threads, len(r.play.scripts)), (BASE_THREADS, 1))
+        r.threads = 0
+        self.assertIn("No threads", r.unravel_problem())
+        with self.assertRaises(ValueError):
+            r.unravel(1)
+        r.threads = 1
+        r.state = "upgrade"
+        self.assertTrue(r.unravel_problem())
+        with self.assertRaises(ValueError):
+            r.unravel(1)
+
+    def test_a_cleared_floor_cannot_be_unravelled(self):
+        fp = FloorPlay(make_floor(["SE"]), Run(seed=1).mods(), 2)
+        fp.act(R)
+        self.assertEqual(fp.status, "cleared")
+        with self.assertRaises(ValueError):
+            fp.unravel(1)
+
+    def test_threads_are_earned_per_floor_and_carry_over(self):
+        r = Run(seed=1)
+        r.threads = 1
+        rig(r, ["SE"])
+        r.act(R)
+        self.assertEqual(r.threads, 1 + THREADS_PER_FLOOR)
+        r.apply_upgrade(r.options[0])
+        self.assertEqual(r.threads, 1 + THREADS_PER_FLOOR)
+
+    def test_unravelling_changes_what_later_echoes_meet(self):
+        # echo 1 kills the crawler; once it is unravelled the crawler survives to meet echo 2
+        r = Run(seed=1)
+        rig(r, ["S.C....", "......."], limit=30)
+        r.sim.enemies[0].awake = True
+        for a in [move(1, 0), move(1, 0), ANCHOR]:
+            r.act(a)
+        r.sim.enemies[0].awake = True
+        for _ in range(2):
+            r.act(WAIT)
+        self.assertFalse(r.sim.enemies[0].alive)
+        r.unravel(1)
+        self.assertTrue(r.sim.enemies[0].alive)
+        self.assertEqual(r.sim.ghosts, [])
 
 
 class MetaTests(unittest.TestCase):
@@ -301,3 +443,59 @@ class FullRuns(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Lamps(unittest.TestCase):
+    """The sconces of the stair: walk close to light them; they stay lit, show what is near them,
+    and are worth points."""
+
+    def rigged(self, torches, rows=("###########", "#S.......E#", "#.........#", "###########")):
+        r = Run(seed=1)
+        f = rig(r, list(rows))
+        f._torch_cache = (f, list(torches))
+        r.lit = set()
+        return r
+
+    def test_a_sconce_lights_when_you_walk_within_reach(self):
+        r = self.rigged([(5, 0)])                 # above the corridor, 4 steps along
+        r.light_lamps()
+        self.assertEqual(r.lit, set())            # too far from the start
+        r.act(R)
+        self.assertEqual(r.lit, set())            # (2, 1) is still more than two steps away
+        r.act(R)
+        self.assertEqual(r.lit, {(5, 0)})         # (3, 1): close enough, nothing in between
+
+    def test_a_wall_in_between_keeps_it_cold(self):
+        rows = ("###########", "#S..#....E#", "#...#.....#", "###########")
+        r = self.rigged([(5, 0)], rows)
+        self.assertEqual(r.light_lamps((3, 1)), [])   # close, but the wall at (4, 1) is in the way
+        self.assertEqual(r.light_lamps((6, 1)), [(5, 0)])
+
+    def test_lit_sconces_stay_lit_across_loops_and_show_their_surroundings(self):
+        r = self.rigged([(5, 0)])
+        for a in [R, R, R]:
+            r.act(a)
+        r.act(ANCHOR)
+        self.assertEqual(r.play.loop_no, 2)
+        self.assertIn((5, 0), r.lit)
+        glow = r.lamp_glow()
+        self.assertIn((5, 1), glow)
+        self.assertIn((7, 2), glow)
+        self.assertNotIn((1, 1), glow)
+
+    def test_lamps_are_counted_and_scored_when_the_floor_is_cleared(self):
+        from echo.score import LAMP_BONUS, SCORE_MAX
+        r = self.rigged([(3, 0), (5, 6)])         # one on the way, one out of reach in the rock
+        for _ in range(8):
+            r.act(R)
+        res = r.last_result
+        self.assertEqual((res.lamps, res.lamps_total), (1, 2))
+        self.assertEqual(res.lamp_points, LAMP_BONUS // 2)
+        self.assertEqual(res.score, SCORE_MAX + LAMP_BONUS // 2)
+
+    def test_a_new_floor_starts_dark(self):
+        r = Run(seed=2)
+        self.assertTrue(r.torches)
+        r.lit = set(r.torches)
+        r.start_floor()
+        self.assertLess(len(r.lit), len(r.torches))

@@ -412,3 +412,66 @@ class Determinism(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeversAndGates(unittest.TestCase):
+    # lever A at (3,1) sits below the corridor; gate A blocks the way to the stairs
+    ROWS = ["S..g.E", "...L.."]
+
+    def test_a_shut_gate_refuses_you_with_a_hint(self):
+        sim = new_sim(self.ROWS)
+        run_actions(sim, [R, R])
+        msg = sim.validate(R)
+        self.assertIn("Gate A is shut", msg)
+        self.assertIn("lever A", msg)
+
+    def test_walking_into_a_lever_pulls_it_and_the_gate_stays_open(self):
+        sim = new_sim(self.ROWS)
+        run_actions(sim, [D, R, R])                       # (2,1), next to the lever
+        self.assertIsNone(sim.validate(R))                # pulling is always allowed
+        ev = sim.step(R)
+        self.assertIn(("lever", "P", 0, True, (3, 1)), ev)
+        self.assertIn(("gate", 0, True), ev)
+        self.assertEqual(sim.player.pos, (2, 1))          # a lever is solid: you stay put
+        self.assertEqual(sim.record[-1], R)               # and the pull is recorded like a move
+        self.assertEqual(sim.pulls, [(3, 0)])             # turns 0-2 were moves; the pull is turn 3
+        run_actions(sim, [U, R, R, R])
+        self.assertEqual(sim.over, "exit")
+
+    def test_each_pull_flips_the_gate(self):
+        sim = new_sim(self.ROWS)
+        run_actions(sim, [D, R, R, R])
+        self.assertTrue(sim.gate_open(0))
+        ev = sim.step(R)
+        self.assertIn(("gate", 0, False), ev)
+        self.assertFalse(sim.gate_open(0))
+
+    def test_echoes_pull_levers_on_the_same_turn(self):
+        script = GhostScript([D, R, R, R], "anchor", 1)
+        sim = new_sim(self.ROWS, [script])
+        run_actions(sim, [WAIT, WAIT, WAIT])
+        self.assertFalse(sim.gate_open(0))
+        ev = sim.step(WAIT)                               # turn 3: the echo pulls
+        self.assertIn(("lever", "G1", 0, True, (3, 1)), ev)
+        self.assertEqual(sim.pulls, [])                   # only your own pulls are recorded
+        self.assertTrue(sim.gate_open(0))
+
+    def test_a_gate_is_held_open_while_someone_stands_in_it(self):
+        script = GhostScript([D, R, R, R, U, R, U, WAIT, WAIT], "anchor", 1)
+        sim = new_sim(["S..g.E", "...L.."], [script])
+        run_actions(sim, [WAIT] * 5)
+        self.assertTrue(sim.gate_open(0))
+
+    def test_levers_are_solid_for_enemies_but_do_not_block_sight(self):
+        sim = new_sim(self.ROWS)
+        self.assertTrue(sim.blocked((3, 1)))
+        self.assertFalse(sim.blocks_sight(3, 1))
+        self.assertTrue(sim.blocks_sight(3, 0))           # the shut gate does
+        self.assertTrue(sim.blocked((3, 0)))
+
+    def test_striking_a_lever_does_nothing(self):
+        sim = new_sim(self.ROWS)
+        run_actions(sim, [D, R, R])
+        ev = sim.step(("f", 1, 0))
+        self.assertIn("swing", [e[0] for e in ev])
+        self.assertFalse(sim.gate_open(0))

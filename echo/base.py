@@ -35,7 +35,7 @@ class Screen:
         return None
 
     def draw_buttons(self, surf):
-        font = self.app.fonts[22]
+        font = self.app.bold[22]
         for b in self.buttons:
             b.draw(surf, font, hover=b is self.hover)
 

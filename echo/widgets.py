@@ -2,15 +2,20 @@
 
 import pygame
 
-BG = (14, 15, 22)
-PANEL = (26, 28, 40)
-PANEL_LIGHT = (38, 41, 58)
-TEXT = (232, 234, 244)
-DIM = (140, 146, 170)
-GOOD = (110, 220, 130)
-BAD = (240, 96, 96)
-WARN = (244, 196, 84)
-ACCENT = (120, 200, 255)
+# Lamplit stone: near-black violet, parchment text, bronze rims, gold for light, violet for thread.
+BG = (12, 10, 16)
+PANEL = (26, 22, 28)
+PANEL_LIGHT = (44, 38, 46)
+TEXT = (238, 228, 208)
+DIM = (164, 150, 134)
+GOOD = (150, 216, 120)
+BAD = (236, 96, 82)
+WARN = (246, 192, 92)
+ACCENT = (242, 200, 118)
+ECHO = (140, 214, 250)
+THREAD = (226, 164, 236)        # threads: what unravelling an echo costs
+BRONZE = (150, 112, 64)
+STONE_BTN = (54, 46, 50)
 
 
 def draw_text(surf, font, text, pos, color=TEXT, center=False, right=False):
@@ -49,6 +54,17 @@ def draw_wrapped(surf, font, text, pos, width, color=TEXT, spacing=3):
     return y
 
 
+def draw_spool(surf, center, color):
+    """A small spool of thread, the icon for threads."""
+    cx, cy = center
+    pygame.draw.rect(surf, color, (cx - 6, cy - 8, 12, 3), border_radius=1)
+    pygame.draw.rect(surf, color, (cx - 6, cy + 5, 12, 3), border_radius=1)
+    pygame.draw.rect(surf, tuple(v // 2 for v in color), (cx - 4, cy - 5, 8, 10))
+    for k in range(3):
+        y = cy - 4 + k * 3
+        pygame.draw.line(surf, color, (cx - 4, y), (cx + 3, y + 2), 1)
+
+
 def tint(surf, rect, color, alpha):
     s = pygame.Surface(rect.size, pygame.SRCALPHA)
     s.fill((*color, alpha))
@@ -56,7 +72,7 @@ def tint(surf, rect, color, alpha):
 
 
 class Button:
-    def __init__(self, rect, label, callback, enabled=True, color=(58, 66, 96),
+    def __init__(self, rect, label, callback, enabled=True, color=STONE_BTN,
                  key=None, tag="", active=False):
         self.rect = pygame.Rect(rect)
         self.label = label
@@ -74,14 +90,19 @@ class Button:
         return False
 
     def draw(self, surf, font, hover=False):
-        base = self.color if self.enabled else (34, 36, 48)
+        r = self.rect
+        base = self.color if self.enabled else (32, 28, 32)
         if self.enabled and hover:
-            base = tuple(min(255, c + 24) for c in base)
-        pygame.draw.rect(surf, base, self.rect, border_radius=6)
-        if self.active:
-            pygame.draw.rect(surf, ACCENT, self.rect, 3, border_radius=6)
+            base = tuple(min(255, c + 22) for c in base)
+        top = tuple(min(255, c + 14) for c in base)
+        pygame.draw.rect(surf, base, r, border_radius=6)
+        pygame.draw.rect(surf, top, (r.x + 2, r.y + 2, r.w - 4, r.h // 2 - 1), border_radius=5)
+        if self.active or (self.enabled and hover):
+            pygame.draw.rect(surf, ACCENT, r, 2, border_radius=6)
         elif self.enabled:
-            pygame.draw.rect(surf, (96, 106, 144), self.rect, 1, border_radius=6)
-        color = TEXT if self.enabled else (96, 100, 120)
+            pygame.draw.rect(surf, BRONZE, r, 1, border_radius=6)
+        else:
+            pygame.draw.rect(surf, (60, 52, 50), r, 1, border_radius=6)
+        color = TEXT if self.enabled else (110, 100, 96)
         img = font.render(self.label, True, color)
-        surf.blit(img, img.get_rect(center=self.rect.center))
+        surf.blit(img, img.get_rect(center=(r.centerx, r.centery + 1)))

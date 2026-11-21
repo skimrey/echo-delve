@@ -5,7 +5,12 @@ Actions: ("w",) wait, ("m",dx,dy) move, ("f",dx,dy) strike, ("a",) anchor (end t
 Turn order: you, then each echo (replaying a recorded loop), then the enemies,
 then spikes. Echoes and you pass through each other; enemies are solid.
 A door is open while anything stands on its plate or in its doorway.
+A lever is solid: moving into it pulls it, which flips its gate (shut <-> open) for the rest of
+the loop. Echoes pull levers too, on the same turn you did. A gate is also held open while
+anything stands in it.
 """
+
+LETTERS = "ABCDEFGH"
 
 from collections import deque
 from dataclasses import dataclass
@@ -34,7 +39,10 @@ class Mods:
 class GhostScript:
     actions: list
     ending: str          # "anchor": stays where it ended; "dead": fades when the recording ends
-    label: int           # 1-based echo number
+    label: int           # 1-based echo slot number (an unravelled slot is reused by the next loop)
+    loop: int = 0        # the loop of the floor it was recorded in
+    end_pos: tuple = None  # where you stood when the recorded loop ended
+    pulls: tuple = ()    # (turn, lever) for every lever pulled in the recorded loop
 
 
 class Actor:
@@ -73,6 +81,8 @@ class LoopSim:
             spec = ENEMIES[kind]
             self.enemies.append(Actor("E%d" % i, "e", kind, x, y, spec["hp"], spec["dmg"]))
         self.potions = set(floor.potions)
+        self.gate_flipped = [False] * len(floor.gates)
+        self.pulls = []             # (turn, lever) pulled by you this loop: kept with the echo it becomes
         self.over = None          # None | "exit" | "dead" | "anchor" | "timeout"
         self.record = []
         self.events = []
@@ -99,18 +109,28 @@ class LoopSim:
     def plate_held(self, i):
         return self.occupied(self.floor.plates[i])
 
+    def gate_open(self, j):
+        return self.gate_flipped[j] or self.occupied(self.floor.gates[j])
+
     def door_closed_at(self, pos):
+        """True for a shut door or gate."""
         i = self.floor.door_at.get(pos)
-        return i is not None and not self.door_open(i)
+        if i is not None:
+            return not self.door_open(i)
+        j = self.floor.gate_at.get(pos)
+        return j is not None and not self.gate_open(j)
 
     def blocked(self, pos):
-        return self.floor.is_wall(*pos) or self.door_closed_at(pos)
+        return self.floor.is_wall(*pos) or self.door_closed_at(pos) or pos in self.floor.lever_at
 
     def blocks_sight(self, x, y):
-        return self.blocked((x, y))
+        return self.floor.is_wall(x, y) or self.door_closed_at((x, y))
 
     def door_states(self):
         return [self.door_open(i) for i in range(len(self.floor.doors))]
+
+    def gate_states(self):
+        return [self.gate_open(j) for j in range(len(self.floor.gates))]
 
     # ------------------------------------------------------------ player input
     def validate(self, action):
@@ -123,6 +143,9 @@ class LoopSim:
         if self.floor.is_wall(nx, ny):
             return "A wall blocks the way."
         if self.door_closed_at((nx, ny)):
+            if (nx, ny) in self.floor.gate_at:
+                c = LETTERS[self.floor.gate_at[(nx, ny)]]
+                return "Gate %s is shut. Pulling lever %s flips it open." % (c, c)
             n = self.floor.door_at[(nx, ny)] + 1
             return "Door %d is sealed. Something must stand on plate %d." % (n, n)
         return None
@@ -133,6 +156,7 @@ class LoopSim:
             raise RuntimeError("loop already over")
         ev = self.events = []
         doors_before = self.door_states()
+        gates_before = self.gate_states()
         if action[0] == "a":
             self.over = "anchor"
             ev.append(("anchor", self.player.pos))
@@ -157,6 +181,9 @@ class LoopSim:
         for i, (before, after) in enumerate(zip(doors_before, self.door_states())):
             if before != after:
                 ev.append(("door", i, after))
+        for j, (before, after) in enumerate(zip(gates_before, self.gate_states())):
+            if before != after:
+                ev.append(("gate", j, after))
         self.turn += 1
         if self.over is None and self.turn >= self.limit:
             self.over = "timeout"
@@ -177,6 +204,13 @@ class LoopSim:
             ev.append(("attack", a.key, foe.key, a.dmg, foe.pos))
             self._damage(foe, a.dmg, a, ev)
             return "attack"
+        j = self.floor.lever_at.get((nx, ny))
+        if j is not None:
+            self.gate_flipped[j] = not self.gate_flipped[j]
+            if a is self.player:
+                self.pulls.append((self.turn, j))
+            ev.append(("lever", a.key, j, self.gate_flipped[j], (nx, ny)))
+            return "pulled"
         if self.floor.is_wall(nx, ny) or self.enemy_at(nx, ny) is not None:
             return "blocked"
         if self.door_closed_at((nx, ny)):

@@ -13,7 +13,7 @@ import random
 from collections import deque
 from dataclasses import dataclass, field
 
-from .consts import (DIRS, DOORS_PER_FLOOR, GRID_H, GRID_W, MAX_FLOOR,
+from .consts import (DIRS, GRID_H, GRID_W, LEVER_MIN_DIST, LEVER_SLACK, LOCKS_PER_FLOOR, MAX_FLOOR,
                      SPIKE_HALF)
 
 
@@ -59,12 +59,22 @@ class Floor:
     rooms: list
     attempts: int = 1
     verified: bool = False
+    gates: list = field(default_factory=list)        # gate j: shut until lever j is pulled (then flips per pull)
+    levers: list = field(default_factory=list)       # solid tiles; walking into one pulls it
+    lock_order: list = field(default_factory=list)   # ("door", i) / ("gate", j) in the order they bar the way
     door_at: dict = field(default_factory=dict)
     plate_at: dict = field(default_factory=dict)
+    gate_at: dict = field(default_factory=dict)
+    lever_at: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.door_at = {p: i for i, p in enumerate(self.doors)}
         self.plate_at = {p: i for i, p in enumerate(self.plates)}
+        self.gate_at = {p: j for j, p in enumerate(self.gates)}
+        self.lever_at = {p: j for j, p in enumerate(self.levers)}
+        if not self.lock_order:
+            self.lock_order = [("door", i) for i in range(len(self.doors))] + \
+                              [("gate", j) for j in range(len(self.gates))]
 
     def is_wall(self, x, y):
         return not (0 <= x < GRID_W and 0 <= y < GRID_H) or self.walls[y][x]
@@ -187,8 +197,13 @@ def _straight_corridor(walls, p):
     return ax == -bx and ay == -by
 
 
+def _manhattan(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
 def _try_build(rng, index):
-    n_doors = DOORS_PER_FLOOR[min(index, MAX_FLOOR) - 1]
+    kinds_of_lock = LOCKS_PER_FLOOR[min(index, MAX_FLOOR) - 1]
+    n_locks = len(kinds_of_lock)
     n_rooms = min(6 + index // 2 + 1, 10)
     walls, rooms = _layout(rng, n_rooms)
     if len(rooms) < 6:
@@ -203,10 +218,10 @@ def _try_build(rng, index):
         return None
     start, exit_ = start_room.center, exit_room.center
     path = bfs_path(walls, start, exit_)
-    if path is None or len(path) < 14 + 8 * n_doors:
+    if path is None or len(path) < 14 + 8 * n_locks:
         return None
 
-    # door candidates: straight corridor tiles on the path whose loss cuts the exit off
+    # lock candidates: straight corridor tiles on the path whose loss cuts the exit off
     cands = []
     for idx in range(3, len(path) - 3):
         p = path[idx]
@@ -215,35 +230,65 @@ def _try_build(rng, index):
         if exit_ in bfs_dist(walls, start, blocked={p}):
             continue
         cands.append((idx, p))
-    if len(cands) < n_doors:
+    if len(cands) < n_locks:
         return None
-    chosen = [cands[len(cands) * (k + 1) // (n_doors + 1)] for k in range(n_doors)]
+    chosen = [cands[len(cands) * (k + 1) // (n_locks + 1)] for k in range(n_locks)]
     chosen = sorted(set(chosen))
-    if len(chosen) < n_doors or any(chosen[i + 1][0] - chosen[i][0] < 4 for i in range(len(chosen) - 1)):
+    if len(chosen) < n_locks or any(chosen[i + 1][0] - chosen[i][0] < 4 for i in range(len(chosen) - 1)):
         return None
-    doors = [p for _, p in chosen]
+    lock_pos = [p for _, p in chosen]
+    path_set = set(path)
 
-    used = {start, exit_, *doors}
-    plates, region_dists = [], []
-    for k in range(n_doors):
-        region = bfs_dist(walls, start, blocked=set(doors[k:]))
-        opts = []
-        for p, d in region.items():
-            if p in used or d < 5 or not _in_room(rooms, p):
-                continue
-            if any(abs(p[0] - q[0]) + abs(p[1] - q[1]) <= 3 for q in doors):
-                continue
-            if start_room.contains(*p):
-                continue
-            opts.append((d, p))
-        if not opts:
-            return None
-        opts.sort()
-        pool = opts[len(opts) // 2:] or opts
-        d, p = rng.choice(pool)
-        plates.append(p)
-        used.add(p)
-        region_dists.append(d)
+    used = {start, exit_, *lock_pos}
+    doors, plates, gates, levers, lock_order, region_dists = [], [], [], [], [], []
+    all_open = len(bfs_dist(walls, start))
+    for k, kind in enumerate(kinds_of_lock):
+        region = bfs_dist(walls, start, blocked=set(lock_pos[k:]) | set(levers))
+        if kind == "plate":
+            opts = []
+            for p, d in region.items():
+                if p in used or d < 5 or not _in_room(rooms, p):
+                    continue
+                if any(_manhattan(p, q) <= 3 for q in lock_pos):
+                    continue
+                if start_room.contains(*p):
+                    continue
+                opts.append((d, p))
+            if not opts:
+                return None
+            opts.sort()
+            pool = opts[len(opts) // 2:] or opts
+            d, p = rng.choice(pool)
+            lock_order.append(("door", len(doors)))
+            doors.append(lock_pos[k])
+            plates.append(p)
+            used.add(p)
+            region_dists.append(d)
+        else:
+            # a lever as far as possible (on foot) from its gate, in a room off the main route
+            from_gate = bfs_dist(walls, lock_pos[k], blocked=set(lock_pos[k + 1:]) | set(levers))
+            opts = []
+            for p in region:
+                if p in used or p in path_set or not _in_room(rooms, p) or start_room.contains(*p):
+                    continue
+                if any(_manhattan(p, q) <= 3 for q in lock_pos) or from_gate.get(p, 0) < LEVER_MIN_DIST:
+                    continue
+                opts.append((from_gate[p], p))
+            opts.sort(reverse=True)
+            valid = []
+            for _, p in opts[:12]:
+                # a solid lever must never cut anything off
+                if len(bfs_dist(walls, start, blocked=set(levers) | {p})) == all_open - len(levers) - 1:
+                    valid.append(p)
+                    if len(valid) == 3:
+                        break
+            if not valid:
+                return None
+            pick = rng.choice(valid)
+            lock_order.append(("gate", len(gates)))
+            gates.append(lock_pos[k])
+            levers.append(pick)
+            used.add(pick)
 
     dist_exit = len(path) - 1
     limit = int(max([dist_exit] + region_dists) * 1.6) + 16
@@ -262,43 +307,72 @@ def _try_build(rng, index):
             used.add(p)
         return picks
 
+    def beside_lock(p, dist=2):
+        return any(_manhattan(p, q) <= dist for q in lock_pos)
+
     spikes = {}
     if index >= 2:
-        for p in take(lambda p: start_d.get(p, 0) >= 5, index + 1):
+        for p in take(lambda p: start_d.get(p, 0) >= 5 and not beside_lock(p, 1), 1 + index * 2 // 3):
             spikes[p] = rng.randint(0, 1)
         # spikes in corridors make timing matter on the route itself
-        corr = [p for p in path[4:-4] if p not in used and not _in_room(rooms, p)
-                and all(abs(p[0] - q[0]) + abs(p[1] - q[1]) > 2 for q in doors)]
-        for p in rng.sample(corr, min(len(corr), index // 2)):
+        corr = [p for p in path[4:-4] if p not in used and not _in_room(rooms, p) and not beside_lock(p)]
+        for p in rng.sample(corr, min(len(corr), index // 3)):
             spikes[p] = rng.randint(0, 1)
             used.add(p)
 
-    potions = take(lambda p: start_d.get(p, 0) >= 3, 1 + index // 3)
+    potions = take(lambda p: start_d.get(p, 0) >= 3, 1 + index // 4)
 
-    kinds = ["crawler"] + (["archer"] if index >= 2 else []) + (["brute"] if index >= 3 else [])
+    kinds = ["crawler"] + (["archer"] if index >= 2 else []) + (["brute"] if index >= 4 else [])
     spawns = []
-    for p in take(lambda p: start_d.get(p, 0) >= 8 and p not in spikes, min(1 + index, 7)):
+    n_foes = min(2 + index // 2, 7) - (1 if index >= MAX_FLOOR else 0)     # the Warden makes up the last
+    for p in take(lambda p: start_d.get(p, 0) >= 8 and p not in spikes and not beside_lock(p, 1), n_foes):
         spawns.append((rng.choice(kinds), p[0], p[1]))
-    if index >= 2:
-        for plate in plates:
+    if index >= 3:
+        for spot_of in plates + levers:               # some plates and levers have a guard
             if rng.random() < 0.5:
-                room = next(r for r in rooms if r.contains(*plate))
-                spot = take(lambda p: room.contains(*p) and 2 <= abs(p[0] - plate[0]) + abs(p[1] - plate[1]) <= 5
-                            and p not in spikes)
+                room = next((r for r in rooms if r.contains(*spot_of)), None)
+                if room is None:
+                    continue
+                spot = take(lambda p: room.contains(*p) and 2 <= _manhattan(p, spot_of) <= 5 and p not in spikes)
                 if spot:
                     spawns.append((rng.choice(kinds), spot[0][0], spot[0][1]))
     if index >= MAX_FLOOR:
-        spot = take(lambda p: exit_room.contains(*p) and abs(p[0] - exit_[0]) + abs(p[1] - exit_[1]) in (2, 3)
-                    and p not in spikes)
+        spot = take(lambda p: exit_room.contains(*p) and _manhattan(p, exit_) in (2, 3) and p not in spikes)
         if spot:
             spawns.append(("warden", spot[0][0], spot[0][1]))
 
-    return Floor(index=index, seed=0, walls=walls, start=start, exit=exit_, doors=doors,
-                 plates=plates, spikes=spikes, potions=potions, spawns=spawns, limit=limit,
-                 rooms=rooms)
+    floor = Floor(index=index, seed=0, walls=walls, start=start, exit=exit_, doors=doors,
+                  plates=plates, spikes=spikes, potions=potions, spawns=spawns, limit=limit,
+                  rooms=rooms, gates=gates, levers=levers, lock_order=lock_order)
+    if levers and not _tune_lever_limit(floor):
+        return None
+    return floor
 
 
-def generate_floor(seed, index, verify=True, max_attempts=40):
+def _tune_lever_limit(floor):
+    """Lever floors get a tight turn limit: enough for every loop of the par solution plus some
+    slack, but too few to pull a lever and then walk to the stairs in the same loop."""
+    from .score import par_plan
+    plan = par_plan(floor)
+    if plan is None:
+        return False
+    to_exit = bfs_dist(floor.walls, floor.exit, blocked=set(floor.levers))
+    single = []             # fastest "pull it yourself, then run for the stairs" for each lever
+    for k, (kind, j) in enumerate(floor.lock_order):
+        if kind == "gate":
+            beside = [to_exit[n] for n in neighbors(*floor.levers[j]) if n in to_exit]
+            if not beside:
+                return False
+            single.append(plan[k] + min(beside))
+    # the most slack (up to LEVER_SLACK) that still leaves every lever out of single-loop reach
+    slack = min(LEVER_SLACK, min(single) - max(plan) - 3)
+    if slack < LEVER_SLACK - 4:
+        return False
+    floor.limit = max(plan) + slack
+    return True
+
+
+def generate_floor(seed, index, verify=True, max_attempts=60):
     """Build floor `index` for `seed`. With verify=True the floor is re-rolled until a
     bot can clear it with the baseline kit (see bot.floor_is_solvable)."""
     last = None
@@ -321,5 +395,39 @@ def generate_floor(seed, index, verify=True, max_attempts=40):
 
 
 def loops_needed(floor):
-    """Echoes needed to hold every plate, plus the final run."""
-    return len(floor.doors) + 1
+    """One echo per lock (to hold its plate or pull its lever), plus the final run."""
+    return len(floor.lock_order) + 1
+
+
+def place_torches(floor):
+    """Wall tiles that carry a sconce: on the wall face above room floor, a couple per room,
+    plus a few along corridors. Purely decorative; uses its own RNG so dungeons never change."""
+    rng = random.Random(floor.seed * 9176 + floor.index * 31337 + 5)
+    walls = floor.walls
+
+    def face(x, y):
+        return (0 <= x < GRID_W and 1 <= y < GRID_H - 1 and walls[y][x] and not walls[y + 1][x]
+                and (x, y + 1) not in floor.door_at and (x, y + 1) not in floor.gate_at)
+
+    torches = []
+    for r in floor.rooms:
+        y = r.y - 1
+        spots = [x for x in range(r.x, r.x + r.w) if face(x, y)]
+        if not spots:
+            continue
+        if len(spots) >= 6:
+            picks = [spots[1], spots[-2]]
+        else:
+            picks = [spots[len(spots) // 2]]
+        torches.extend((x, y) for x in picks)
+    taken = set(torches)
+    corridor = [(x, y) for y in range(GRID_H) for x in range(GRID_W)
+                if face(x, y) and not any(r.contains(x, y + 1) for r in floor.rooms)]
+    rng.shuffle(corridor)
+    for p in corridor:
+        if len(torches) >= len(floor.rooms) * 2 + 4:
+            break
+        if all(abs(p[0] - q[0]) + abs(p[1] - q[1]) >= 7 for q in taken):
+            torches.append(p)
+            taken.add(p)
+    return sorted(torches)

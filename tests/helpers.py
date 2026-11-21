@@ -9,7 +9,7 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from echo.consts import GRID_H, GRID_W  # noqa: E402
-from echo.floor import Floor, Rect  # noqa: E402
+from echo.floor import Floor, Rect, bfs_dist  # noqa: E402
 from echo.sim import GhostScript, LoopSim, Mods, move  # noqa: E402
 
 KINDS = {"C": "crawler", "A": "archer", "B": "brute", "W": "warden"}
@@ -19,11 +19,14 @@ def make_floor(rows, limit=60, index=1):
     """Build a Floor from ASCII art placed at the top-left of the grid.
 
     # wall   . floor   S start   E exit   1-4 door k   a-d plate k
+    g h gate A/B   L M lever A/B
     ^ spike (phase 0)   v spike (phase 1)   p potion   C A B W enemies
+    Locks are ordered by their distance from the start.
     """
     walls = [[True] * GRID_W for _ in range(GRID_H)]
     start = exit_ = None
     doors, plates, spikes, potions, spawns = {}, {}, {}, [], []
+    gates, levers = {}, {}
     for y, row in enumerate(rows):
         for x, ch in enumerate(row):
             if ch == "#":
@@ -37,6 +40,10 @@ def make_floor(rows, limit=60, index=1):
                 doors[int(ch) - 1] = (x, y)
             elif ch in "abcd":
                 plates["abcd".index(ch)] = (x, y)
+            elif ch in "gh":
+                gates["gh".index(ch)] = (x, y)
+            elif ch in "LM":
+                levers["LM".index(ch)] = (x, y)
             elif ch == "^":
                 spikes[(x, y)] = 0
             elif ch == "v":
@@ -49,11 +56,15 @@ def make_floor(rows, limit=60, index=1):
     if exit_ is None:
         exit_ = (GRID_W - 2, GRID_H - 2)
         walls[exit_[1]][exit_[0]] = False
-    n = len(doors)
+    n, m = len(doors), len(gates)
+    dist = bfs_dist(walls, start)
+    order = sorted([("door", i) for i in range(n)] + [("gate", j) for j in range(m)],
+                   key=lambda lk: dist.get(doors[lk[1]] if lk[0] == "door" else gates[lk[1]], 999))
     return Floor(index=index, seed=0, walls=walls, start=start, exit=exit_,
                  doors=[doors[i] for i in range(n)], plates=[plates[i] for i in range(n)],
                  spikes=spikes, potions=potions, spawns=spawns, limit=limit,
-                 rooms=[Rect(0, 0, GRID_W, GRID_H)])
+                 rooms=[Rect(0, 0, GRID_W, GRID_H)], gates=[gates[j] for j in range(m)],
+                 levers=[levers[j] for j in range(m)], lock_order=order)
 
 
 def new_sim(rows, scripts=(), mods=None, **kw):
@@ -74,3 +85,15 @@ def kinds(events):
 
 
 R, L, U, D = move(1, 0), move(-1, 0), move(0, -1), move(0, 1)
+
+
+_FLOORS = {}
+
+
+def cached_floor(seed, index, verify=True):
+    """generate_floor, memoised across the test run (floors are never mutated by play)."""
+    from echo.floor import generate_floor
+    key = (seed, index, verify)
+    if key not in _FLOORS:
+        _FLOORS[key] = generate_floor(seed, index, verify=verify)
+    return _FLOORS[key]
